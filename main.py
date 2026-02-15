@@ -20,10 +20,9 @@ logger = logging.getLogger(__name__)
  SELECT_SERVICE_TYPE, SET_LAST_OIL_CHANGE, ADD_SERVICE) = range(11)
 
 # Конфигурация - читаем токен из переменных окружения
-BOT_TOKEN = os.environ.get('8477674042:AAEOFIOLskgqEfOzFzD2zSDyIvA8vBLyV-Q)
+BOT_TOKEN = "8477674042:AAEOFIOLskgqEfOzFzD2zSDyIvA8vBLyV-Q"
 if not BOT_TOKEN:
-    logger.error("❌ Токен бота не найден в переменных окружения!")
-    logger.error("Установите переменную окружения BOT_TOKEN")
+    logger.error("❌ Токен бота не найден!")
     sys.exit(1)
 
 logger.info("✅ Токен бота успешно загружен")
