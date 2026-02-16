@@ -1,6 +1,6 @@
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ConversationHandler, \
     ContextTypes, filters
@@ -9,13 +9,41 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Состояния для разговора
+# Состояния для разговора - 38 состояний (ИСПРАВЛЕНО)
 (MAIN_MENU, SELECT_CAR, ADD_CAR, EDIT_CAR, DELETE_CAR,
  ADD_EXPENSE, SET_TOTAL_INVESTMENT, DELETE_EXPENSE,
- SELECT_SERVICE_TYPE, SET_LAST_OIL_CHANGE, ADD_SERVICE) = range(11)
+ SELECT_SERVICE_TYPE, SERVICE_HISTORY,
+ # Состояния для пошагового добавления авто
+ CAR_NAME, CAR_BRAND, CAR_MODEL, CAR_YEAR, CAR_VIN, CAR_PLATE,
+ # Состояния для пошагового редактирования авто
+ EDIT_CAR_NAME, EDIT_CAR_BRAND, EDIT_CAR_MODEL, EDIT_CAR_YEAR, EDIT_CAR_VIN, EDIT_CAR_PLATE,
+ # Состояния для пошаговой замены масла
+ OIL_MILEAGE, OIL_TYPE, OIL_INTERVAL, OIL_DATE,
+ # Состояния для расходов
+ EXPENSE_AMOUNT, EXPENSE_DESC, EXPENSE_MILEAGE, EXPENSE_DATE,
+ # Состояния для ТО и расходников
+ SERVICE_MILEAGE, SERVICE_DESC, SERVICE_COST,
+ # Состояния для расходников
+ CONSUMABLE_NAME, CONSUMABLE_PART_NUMBER, CONSUMABLE_CAR,
+ # Состояние для удаления расходника и подтверждения удаления авто
+ DELETE_CONSUMABLE, DELETE_CAR_CONFIRM) = range(38)  # 0-37 = 38 состояний
 
 # Конфигурация
 BOT_TOKEN = '8477674042:AAEOFIOLskgqEfOzFzD2zSDyIvA8vBLyV-Q'  # Замените на ваш токен
+
+# Каталоги - только нужные ссылки
+CAR_CATALOGS = {
+    'japanese': {
+        'name': '🇯🇵 Японские автомобили',
+        'url': 'https://www.japancats.ru/',
+        'description': 'Каталог запчастей для японских автомобилей по VIN'
+    },
+    'bmw': {
+        'name': '🇩🇪 BMW',
+        'url': 'https://etk.club/',
+        'description': 'Оригинальные каталоги BMW по VIN'
+    }
+}
 
 
 class CarFinanceBot:
@@ -23,7 +51,7 @@ class CarFinanceBot:
         self.init_database()
 
     def init_database(self):
-        """Инициализация базы данных с проверкой структуры"""
+        """Инициализация и миграция базы данных"""
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
 
@@ -38,60 +66,53 @@ class CarFinanceBot:
             )
         ''')
 
-        # Проверяем существование таблицы cars и её структуру
+        # Проверяем существование таблицы cars
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cars'")
         table_exists = cursor.fetchone()
 
         if table_exists:
-            # Проверяем, есть ли колонка user_id в существующей таблице
+            # Проверяем, какие колонки есть в таблице cars
             cursor.execute("PRAGMA table_info(cars)")
             columns = cursor.fetchall()
             column_names = [column[1] for column in columns]
 
-            if 'user_id' not in column_names:
-                print("Обновление структуры базы данных...")
+            # Добавляем колонку vin, если её нет
+            if 'vin' not in column_names:
+                print("🔄 Добавление колонки vin в таблицу cars...")
+                cursor.execute("ALTER TABLE cars ADD COLUMN vin TEXT")
+                print("✅ Колонка vin добавлена")
 
-                # Проверяем, существует ли уже таблица cars_new
-                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cars_new'")
-                cars_new_exists = cursor.fetchone()
+            # Добавляем колонку current_mileage, если её нет
+            if 'current_mileage' not in column_names:
+                print("🔄 Добавление колонки current_mileage в таблицу cars...")
+                cursor.execute("ALTER TABLE cars ADD COLUMN current_mileage INTEGER DEFAULT 0")
+                print("✅ Колонка current_mileage добавлена")
 
-                if not cars_new_exists:
-                    # Создаем новую таблицу с правильной структурой
-                    cursor.execute('''
-                        CREATE TABLE cars_new (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER,
-                            name TEXT NOT NULL,
-                            brand TEXT,
-                            model TEXT,
-                            year INTEGER,
-                            license_plate TEXT,
-                            created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (user_id) REFERENCES users (id)
-                        )
-                    ''')
+            # Добавляем колонку expense_date в daily_expenses, если её нет
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_expenses'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(daily_expenses)")
+                exp_columns = cursor.fetchall()
+                exp_column_names = [col[1] for col in exp_columns]
 
-                    # Копируем данные из старой таблицы
-                    # Для старых записей user_id будет NULL
-                    cursor.execute('''
-                        INSERT INTO cars_new (id, name, brand, model, year, license_plate, created_date)
-                        SELECT id, name, brand, model, year, license_plate, created_date FROM cars
-                    ''')
+                if 'expense_date' not in exp_column_names:
+                    print("🔄 Добавление колонки expense_date в таблицу daily_expenses...")
+                    cursor.execute("ALTER TABLE daily_expenses ADD COLUMN expense_date DATE")
+                    print("✅ Колонка expense_date добавлена")
 
-                    # Удаляем старую таблицу
-                    cursor.execute("DROP TABLE cars")
+            # Добавляем колонку change_date в oil_changes, если её нет
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='oil_changes'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(oil_changes)")
+                oil_columns = cursor.fetchall()
+                oil_column_names = [col[1] for col in oil_columns]
 
-                    # Переименовываем новую таблицу
-                    cursor.execute("ALTER TABLE cars_new RENAME TO cars")
-
-                    print("Структура базы данных успешно обновлена!")
-                else:
-                    # Если cars_new уже существует, просто переименовываем
-                    print("Восстановление структуры базы данных...")
-                    cursor.execute("DROP TABLE IF EXISTS cars")
-                    cursor.execute("ALTER TABLE cars_new RENAME TO cars")
+                if 'change_date' not in oil_column_names:
+                    print("🔄 Добавление колонки change_date в таблицу oil_changes...")
+                    cursor.execute("ALTER TABLE oil_changes ADD COLUMN change_date DATE")
+                    print("✅ Колонка change_date добавлена")
         else:
-            # Создаем таблицу автомобилей с привязкой к пользователю
+            # Создаем таблицу автомобилей с VIN и текущим пробегом
             cursor.execute('''
                 CREATE TABLE cars (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,21 +121,29 @@ class CarFinanceBot:
                     brand TEXT,
                     model TEXT,
                     year INTEGER,
+                    vin TEXT,
                     license_plate TEXT,
+                    current_mileage INTEGER DEFAULT 0,
                     created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (user_id) REFERENCES users (id)
                 )
             ''')
 
-        # Проверяем и обновляем структуру связанных таблиц
-        self.update_related_tables(cursor)
+        # Таблица для расходов (ремонт и обслуживание)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS daily_expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                car_id INTEGER,
+                amount REAL NOT NULL,
+                description TEXT NOT NULL,
+                mileage INTEGER,
+                expense_date DATE,
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (car_id) REFERENCES cars (id) ON DELETE CASCADE
+            )
+        ''')
 
-        conn.commit()
-        conn.close()
-
-    def update_related_tables(self, cursor):
-        """Обновление структуры связанных таблиц"""
-        # Таблица для общих инвестиций
+        # Таблица для общих инвестиций (покупка авто, крупные вложения)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS total_investments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,20 +155,21 @@ class CarFinanceBot:
             )
         ''')
 
-        # Таблица для ежедневных расходов
+        # Таблица для замены масла
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS daily_expenses (
+            CREATE TABLE IF NOT EXISTS oil_changes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 car_id INTEGER,
-                amount REAL NOT NULL,
-                description TEXT NOT NULL,
-                mileage INTEGER,
+                mileage INTEGER NOT NULL,
+                oil_type TEXT,
+                next_change_mileage INTEGER,
+                change_date DATE,
                 date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (car_id) REFERENCES cars (id) ON DELETE CASCADE
             )
         ''')
 
-        # Таблица для технического обслуживания
+        # Таблица для технического обслуживания (ТО и ремонт)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS service_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -153,116 +183,261 @@ class CarFinanceBot:
             )
         ''')
 
-        # Таблица для отслеживания замены масла
+        # Таблица для расходников (артикулы запчастей)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS oil_changes (
+            CREATE TABLE IF NOT EXISTS consumables (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
                 car_id INTEGER,
-                mileage INTEGER NOT NULL,
-                oil_type TEXT,
-                next_change_mileage INTEGER,
+                name TEXT NOT NULL,
+                part_number TEXT,
+                notes TEXT,
                 date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id),
                 FOREIGN KEY (car_id) REFERENCES cars (id) ON DELETE CASCADE
             )
         ''')
 
+        conn.commit()
+        conn.close()
+        print("✅ База данных готова")
+
     def register_user(self, user_id, username, first_name, last_name):
-        """Регистрация или обновление пользователя"""
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-
-        # Проверяем, существует ли пользователь
         cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-        user = cursor.fetchone()
-
-        if not user:
-            # Добавляем нового пользователя
+        if not cursor.fetchone():
             cursor.execute(
                 "INSERT INTO users (id, username, first_name, last_name) VALUES (?, ?, ?, ?)",
                 (user_id, username, first_name, last_name)
             )
             conn.commit()
-
         conn.close()
 
-    # Методы для работы с автомобилями (теперь с user_id)
-    def add_car(self, user_id, name, brand="", model="", year=None, license_plate=""):
-        """Добавление нового автомобиля для конкретного пользователя"""
+    def add_car(self, user_id, name, brand="", model="", year=None, vin="", license_plate=""):
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO cars (user_id, name, brand, model, year, license_plate) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, name, brand, model, year, license_plate)
+            "INSERT INTO cars (user_id, name, brand, model, year, vin, license_plate) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, brand, model, year, vin, license_plate)
         )
         car_id = cursor.lastrowid
         conn.commit()
         conn.close()
         return car_id
 
-    def get_user_cars(self, user_id):
-        """Получение списка автомобилей пользователя"""
+    def update_car(self, car_id, user_id, name, brand="", model="", year=None, vin="", license_plate=""):
+        """Обновление информации об автомобиле"""
+        if not self.check_car_ownership(car_id, user_id):
+            return False
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, name, brand, model, year, license_plate FROM cars WHERE user_id = ? ORDER BY created_date",
-            (user_id,)
+            "UPDATE cars SET name = ?, brand = ?, model = ?, year = ?, vin = ?, license_plate = ? WHERE id = ? AND user_id = ?",
+            (name, brand, model, year, vin, license_plate, car_id, user_id)
         )
-        cars = cursor.fetchall()
+        updated = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return updated
+
+    def get_user_cars(self, user_id):
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, name, brand, model, year, vin, license_plate, current_mileage FROM cars WHERE user_id = ? ORDER BY created_date",
+                (user_id,)
+            )
+            cars = cursor.fetchall()
+        except sqlite3.OperationalError:
+            # Если ошибка, пробуем без новых колонок
+            cursor.execute(
+                "SELECT id, name, brand, model, year, license_plate FROM cars WHERE user_id = ? ORDER BY created_date",
+                (user_id,)
+            )
+            cars = cursor.fetchall()
+            # Преобразуем в формат с 8 полями
+            cars = [(car[0], car[1], car[2], car[3], car[4], "", car[5], 0) for car in cars]
         conn.close()
         return cars
 
     def get_car_by_id(self, car_id, user_id):
-        """Получение информации об автомобиле по ID (с проверкой владельца)"""
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, name, brand, model, year, license_plate FROM cars WHERE id = ? AND user_id = ?",
-            (car_id, user_id)
-        )
-        car = cursor.fetchone()
+        try:
+            cursor.execute(
+                "SELECT id, name, brand, model, year, vin, license_plate, current_mileage FROM cars WHERE id = ? AND user_id = ?",
+                (car_id, user_id)
+            )
+            car = cursor.fetchone()
+        except sqlite3.OperationalError:
+            cursor.execute(
+                "SELECT id, name, brand, model, year, license_plate FROM cars WHERE id = ? AND user_id = ?",
+                (car_id, user_id)
+            )
+            car_data = cursor.fetchone()
+            if car_data:
+                car = (car_data[0], car_data[1], car_data[2], car_data[3], car_data[4], "", car_data[5], 0)
+            else:
+                car = None
         conn.close()
         return car
 
     def delete_car(self, car_id, user_id):
-        """Удаление автомобиля и всех связанных записей (с проверкой владельца)"""
+        """Удаление автомобиля и всех связанных данных"""
+        if not self.check_car_ownership(car_id, user_id):
+            return False
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-
-        # Сначала проверяем, принадлежит ли автомобиль пользователю
-        cursor.execute("SELECT id FROM cars WHERE id = ? AND user_id = ?", (car_id, user_id))
-        if not cursor.fetchone():
-            conn.close()
-            return False
-
-        # Удаляем автомобиль (связанные записи удалятся автоматически благодаря ON DELETE CASCADE)
+        # Благодаря ON DELETE CASCADE все связанные записи удалятся автоматически
         cursor.execute("DELETE FROM cars WHERE id = ? AND user_id = ?", (car_id, user_id))
-
+        deleted = cursor.rowcount > 0
         conn.commit()
         conn.close()
-        return True
+        return deleted
 
-    def update_car(self, car_id, user_id, name, brand, model, year, license_plate):
-        """Обновление информации об автомобиле (с проверкой владельца)"""
+    def update_car_mileage(self, car_id, user_id, new_mileage):
+        """Обновление текущего пробега автомобиля"""
+        if not self.check_car_ownership(car_id, user_id):
+            return False
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-
-        # Проверяем владельца
-        cursor.execute("SELECT id FROM cars WHERE id = ? AND user_id = ?", (car_id, user_id))
-        if not cursor.fetchone():
-            conn.close()
-            return False
-
         cursor.execute(
-            "UPDATE cars SET name = ?, brand = ?, model = ?, year = ?, license_plate = ? WHERE id = ? AND user_id = ?",
-            (name, brand, model, year, license_plate, car_id, user_id)
+            "UPDATE cars SET current_mileage = ? WHERE id = ? AND user_id = ?",
+            (new_mileage, car_id, user_id)
         )
         conn.commit()
         conn.close()
         return True
 
-    # Методы для работы с расходами (с проверкой владельца через car_id)
+    def add_daily_expense(self, car_id, user_id, amount, description, mileage=None, expense_date=None):
+        if not self.check_car_ownership(car_id, user_id):
+            return False
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+        if not expense_date:
+            expense_date = datetime.now().strftime('%Y-%m-%d')
+
+        # Добавляем расход
+        cursor.execute(
+            "INSERT INTO daily_expenses (car_id, amount, description, mileage, expense_date) VALUES (?, ?, ?, ?, ?)",
+            (car_id, amount, description, mileage, expense_date)
+        )
+
+        # Обновляем текущий пробег, если указан
+        if mileage:
+            cursor.execute(
+                "UPDATE cars SET current_mileage = ? WHERE id = ? AND user_id = ?",
+                (mileage, car_id, user_id)
+            )
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def add_oil_change(self, car_id, user_id, mileage, oil_type="", next_change_mileage=None, change_date=None):
+        if not self.check_car_ownership(car_id, user_id):
+            return False
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+
+        if not change_date:
+            change_date = datetime.now().strftime('%Y-%m-%d')
+
+        if not next_change_mileage:
+            next_change_mileage = mileage + 10000
+
+        cursor.execute(
+            "INSERT INTO oil_changes (car_id, mileage, oil_type, next_change_mileage, change_date) VALUES (?, ?, ?, ?, ?)",
+            (car_id, mileage, oil_type, next_change_mileage, change_date)
+        )
+
+        # Обновляем текущий пробег
+        cursor.execute(
+            "UPDATE cars SET current_mileage = ? WHERE id = ? AND user_id = ?",
+            (mileage, car_id, user_id)
+        )
+
+        # Также добавляем в расходы (замена масла)
+        cursor.execute(
+            "INSERT INTO daily_expenses (car_id, amount, description, mileage, expense_date) VALUES (?, ?, ?, ?, ?)",
+            (car_id, 0, f"Замена масла ({oil_type})", mileage, change_date)
+        )
+
+        conn.commit()
+        conn.close()
+        return True
+
+    def add_service_record(self, car_id, user_id, service_type, mileage, description="", cost=0):
+        if not self.check_car_ownership(car_id, user_id):
+            return False
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO service_records (car_id, service_type, mileage, description, cost) VALUES (?, ?, ?, ?, ?)",
+            (car_id, service_type, mileage, description, cost)
+        )
+
+        # Обновляем текущий пробег
+        cursor.execute(
+            "UPDATE cars SET current_mileage = ? WHERE id = ? AND user_id = ?",
+            (mileage, car_id, user_id)
+        )
+
+        # Также добавляем в расходы, если есть стоимость
+        if cost > 0:
+            cursor.execute(
+                "INSERT INTO daily_expenses (car_id, amount, description, mileage, expense_date) VALUES (?, ?, ?, ?, ?)",
+                (car_id, cost, f"{service_type}: {description}", mileage, datetime.now().strftime('%Y-%m-%d'))
+            )
+        conn.commit()
+        conn.close()
+        return True
+
+    def add_consumable(self, user_id, car_id, name, part_number="", notes=""):
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO consumables (user_id, car_id, name, part_number, notes) VALUES (?, ?, ?, ?, ?)",
+            (user_id, car_id, name, part_number, notes)
+        )
+        consumable_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return consumable_id
+
+    def get_consumables(self, user_id, car_id=None):
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+        if car_id:
+            cursor.execute(
+                "SELECT id, name, part_number, notes, date FROM consumables WHERE user_id = ? AND car_id = ? ORDER BY date DESC",
+                (user_id, car_id)
+            )
+        else:
+            cursor.execute(
+                "SELECT id, name, part_number, notes, date FROM consumables WHERE user_id = ? ORDER BY date DESC",
+                (user_id,)
+            )
+        consumables = cursor.fetchall()
+        conn.close()
+        return consumables
+
+    def delete_consumable(self, consumable_id, user_id):
+        """Удаление расходника"""
+        conn = sqlite3.connect('car_finance.db')
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM consumables WHERE id = ? AND user_id = ?",
+            (consumable_id, user_id)
+        )
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        conn.close()
+        return deleted
+
     def check_car_ownership(self, car_id, user_id):
-        """Проверка, принадлежит ли автомобиль пользователю"""
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
         cursor.execute("SELECT id FROM cars WHERE id = ? AND user_id = ?", (car_id, user_id))
@@ -270,90 +445,33 @@ class CarFinanceBot:
         conn.close()
         return result
 
-    def add_total_investment(self, car_id, user_id, amount, description=""):
-        """Добавление общей инвестиции в машину (с проверкой владельца)"""
-        if not self.check_car_ownership(car_id, user_id):
-            return False
-
-        conn = sqlite3.connect('car_finance.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO total_investments (car_id, amount, description) VALUES (?, ?, ?)",
-            (car_id, amount, description)
-        )
-        conn.commit()
-        conn.close()
-        return True
-
-    def add_daily_expense(self, car_id, user_id, amount, description, mileage=None):
-        """Добавление ежедневного расхода (с проверкой владельца)"""
-        if not self.check_car_ownership(car_id, user_id):
-            return False
-
-        conn = sqlite3.connect('car_finance.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO daily_expenses (car_id, amount, description, mileage) VALUES (?, ?, ?, ?)",
-            (car_id, amount, description, mileage)
-        )
-        conn.commit()
-        conn.close()
-        return True
-
-    def add_oil_change(self, car_id, user_id, mileage, oil_type="", next_change_mileage=None):
-        """Добавление записи о замене масла (с проверкой владельца)"""
-        if not self.check_car_ownership(car_id, user_id):
-            return False
-
-        conn = sqlite3.connect('car_finance.db')
-        cursor = conn.cursor()
-
-        if not next_change_mileage:
-            next_change_mileage = mileage + 10000  # По умолчанию через 10000 км
-
-        cursor.execute(
-            "INSERT INTO oil_changes (car_id, mileage, oil_type, next_change_mileage) VALUES (?, ?, ?, ?)",
-            (car_id, mileage, oil_type, next_change_mileage)
-        )
-        conn.commit()
-        conn.close()
-        return True
-
-    def add_service_record(self, car_id, user_id, service_type, mileage, description="", cost=0):
-        """Добавление записи о техническом обслуживании (с проверкой владельца)"""
-        if not self.check_car_ownership(car_id, user_id):
-            return False
-
-        conn = sqlite3.connect('car_finance.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO service_records (car_id, service_type, mileage, description, cost) VALUES (?, ?, ?, ?, ?)",
-            (car_id, service_type, mileage, description, cost)
-        )
-        conn.commit()
-        conn.close()
-        return True
-
     def get_last_oil_change(self, car_id, user_id):
-        """Получение последней информации о замене масла (с проверкой владельца)"""
         if not self.check_car_ownership(car_id, user_id):
             return None
-
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT mileage, oil_type, next_change_mileage, date FROM oil_changes WHERE car_id = ? ORDER BY date DESC LIMIT 1",
-            (car_id,)
-        )
-        oil_change = cursor.fetchone()
+        try:
+            cursor.execute(
+                "SELECT mileage, oil_type, next_change_mileage, change_date, date FROM oil_changes WHERE car_id = ? ORDER BY date DESC LIMIT 1",
+                (car_id,)
+            )
+            oil_change = cursor.fetchone()
+        except sqlite3.OperationalError:
+            cursor.execute(
+                "SELECT mileage, oil_type, next_change_mileage, date FROM oil_changes WHERE car_id = ? ORDER BY date DESC LIMIT 1",
+                (car_id,)
+            )
+            oc = cursor.fetchone()
+            if oc:
+                oil_change = (oc[0], oc[1], oc[2], oc[3][:10], oc[3])
+            else:
+                oil_change = None
         conn.close()
         return oil_change
 
     def get_service_history(self, car_id, user_id, limit=10):
-        """Получение истории обслуживания (с проверкой владельца)"""
         if not self.check_car_ownership(car_id, user_id):
             return []
-
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
         cursor.execute(
@@ -364,916 +482,1179 @@ class CarFinanceBot:
         conn.close()
         return services
 
-    def get_car_statistics(self, car_id, user_id):
-        """Получение полной статистики по автомобилю (с проверкой владельца)"""
-        if not self.check_car_ownership(car_id, user_id):
-            return None
-
-        conn = sqlite3.connect('car_finance.db')
-        cursor = conn.cursor()
-
-        # Общие инвестиции
-        cursor.execute("SELECT SUM(amount) FROM total_investments WHERE car_id = ?", (car_id,))
-        total_invest = cursor.fetchone()[0] or 0
-
-        # Ежедневные расходы
-        cursor.execute("SELECT SUM(amount) FROM daily_expenses WHERE car_id = ?", (car_id,))
-        daily_total = cursor.fetchone()[0] or 0
-
-        # Последний пробег
-        cursor.execute(
-            "SELECT mileage FROM daily_expenses WHERE car_id = ? AND mileage IS NOT NULL ORDER BY date DESC LIMIT 1",
-            (car_id,))
-        last_mileage = cursor.fetchone()
-        last_mileage = last_mileage[0] if last_mileage else 0
-
-        # Последняя замена масла
-        last_oil = self.get_last_oil_change(car_id, user_id)
-
-        conn.close()
-
-        return {
-            'total_investment': total_invest,
-            'daily_expenses': daily_total,
-            'total': total_invest + daily_total,
-            'last_mileage': last_mileage,
-            'last_oil_change': last_oil
-        }
-
-    def get_recent_expenses(self, car_id, user_id, limit=15):
-        """Получение последних расходов (с проверкой владельца)"""
+    def get_recent_expenses(self, car_id, user_id, days=30):
+        """Получение расходов за последние N дней"""
         if not self.check_car_ownership(car_id, user_id):
             return []
-
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT amount, description, mileage, date FROM daily_expenses WHERE car_id = ? ORDER BY date DESC LIMIT ?",
-            (car_id, limit)
-        )
+        cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        # Проверяем, есть ли колонка expense_date
+        try:
+            cursor.execute(
+                "SELECT amount, description, mileage, expense_date FROM daily_expenses WHERE car_id = ? AND expense_date >= ? ORDER BY expense_date DESC, date DESC",
+                (car_id, cutoff_date)
+            )
+        except sqlite3.OperationalError:
+            # Если нет, используем date
+            cursor.execute(
+                "SELECT amount, description, mileage, date FROM daily_expenses WHERE car_id = ? AND date >= ? ORDER BY date DESC",
+                (car_id, cutoff_date)
+            )
+            expenses = cursor.fetchall()
+            # Преобразуем date в строку даты
+            expenses = [(e[0], e[1], e[2], e[3][:10] if e[3] else datetime.now().strftime('%Y-%m-%d')) for e in
+                        expenses]
+            conn.close()
+            return expenses
+
         expenses = cursor.fetchall()
         conn.close()
         return expenses
 
-    def get_last_expense(self, car_id, user_id):
-        """Получение последнего расхода (с проверкой владельца)"""
+    def get_car_statistics(self, car_id, user_id):
         if not self.check_car_ownership(car_id, user_id):
             return None
-
         conn = sqlite3.connect('car_finance.db')
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, amount, description, date FROM daily_expenses WHERE car_id = ? ORDER BY date DESC LIMIT 1",
-            (car_id,)
-        )
-        expense = cursor.fetchone()
-        conn.close()
-        return expense
 
-    def delete_expense_by_id(self, expense_id, car_id, user_id):
-        """Удаление расхода по ID (с проверкой владельца)"""
-        if not self.check_car_ownership(car_id, user_id):
-            return False
+        cursor.execute("SELECT SUM(amount) FROM daily_expenses WHERE car_id = ?", (car_id,))
+        daily_total = cursor.fetchone()[0] or 0
 
-        conn = sqlite3.connect('car_finance.db')
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM daily_expenses WHERE id = ? AND car_id = ?", (expense_id, car_id))
-        deleted = cursor.rowcount > 0
-        conn.commit()
+        cursor.execute("SELECT SUM(amount) FROM total_investments WHERE car_id = ?", (car_id,))
+        total_invest = cursor.fetchone()[0] or 0
+
+        # Получаем текущий пробег из таблицы cars
+        cursor.execute("SELECT current_mileage FROM cars WHERE id = ?", (car_id,))
+        current_mileage = cursor.fetchone()
+        current_mileage = current_mileage[0] if current_mileage else 0
+
+        last_oil = self.get_last_oil_change(car_id, user_id)
+
+        # Получаем расходы за последние 30 дней
+        recent = self.get_recent_expenses(car_id, user_id, 30)
+
         conn.close()
-        return deleted
+        return {
+            'daily_expenses': daily_total,
+            'total_investment': total_invest,
+            'total': daily_total + total_invest,
+            'last_mileage': current_mileage,
+            'last_oil_change': last_oil,
+            'recent_expenses': recent
+        }
 
 
 # Создаем экземпляр бота
 bot = CarFinanceBot()
-
-# Глобальная переменная для хранения выбранного автомобиля (по пользователю)
 user_car_selection = {}
+
+
+# Функция для создания клавиатуры с кнопкой назад
+def back_keyboard(back_to):
+    """Создает клавиатуру с одной кнопкой назад"""
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_{back_to}")]]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def keyboard_with_back(buttons, back_to):
+    """Добавляет кнопку назад к существующей клавиатуре"""
+    keyboard = buttons.copy()
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_{back_to}")])
+    return InlineKeyboardMarkup(keyboard)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработчик команды /start"""
     user = update.effective_user
+    bot.register_user(user.id, user.username, user.first_name, user.last_name)
 
-    # Регистрируем пользователя
-    bot.register_user(
-        user.id,
-        user.username,
-        user.first_name,
-        user.last_name
-    )
-
-    # Получаем автомобили пользователя
     cars = bot.get_user_cars(user.id)
 
     if not cars:
-        # Если нет автомобилей, предлагаем добавить первый
-        keyboard = [
-            [InlineKeyboardButton("➕ Добавить автомобиль", callback_data='add_car')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
+        keyboard = [[InlineKeyboardButton("➕ Добавить автомобиль", callback_data='add_car')]]
         await update.message.reply_text(
-            f"👋 Здравствуйте, {user.first_name}!\n\n"
-            "🚗 Добро пожаловать в Финансовый ассистент автомобиля!\n\n"
-            "У вас пока нет добавленных автомобилей. Давайте добавим первый!",
-            reply_markup=reply_markup
+            f"👋 Здравствуйте, {user.first_name}!\n\n🚗 У вас нет автомобилей. Добавьте первый:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return ADD_CAR
+        return SELECT_CAR
 
-    # Показываем меню выбора автомобиля
     keyboard = []
-    for car_id, name, brand, model, year, plate in cars:
-        car_info = f"{brand} {model}" if brand and model else name
-        if year:
-            car_info += f" ({year})"
-        keyboard.append([InlineKeyboardButton(f"🚗 {car_info}", callback_data=f'select_car_{car_id}')])
+    for car_id, name, brand, model, year, vin, plate, mileage in cars:
+        car_name = f"{brand} {model}" if brand and model else name
+        keyboard.append([InlineKeyboardButton(f"🚗 {car_name} ({mileage} км)", callback_data=f'select_car_{car_id}')])
 
-    keyboard.append([InlineKeyboardButton("➕ Добавить новый автомобиль", callback_data='add_car')])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard.append([InlineKeyboardButton("➕ Добавить авто", callback_data='add_car')])
 
     await update.message.reply_text(
-        f"👋 С возвращением, {user.first_name}!\n\n"
         "🚗 Выберите автомобиль:",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
     return SELECT_CAR
 
 
 async def car_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, car_id: int) -> int:
-    """Меню для выбранного автомобиля"""
+    """Меню выбранного автомобиля"""
     user_id = update.effective_user.id
-
-    # Проверяем, принадлежит ли автомобиль пользователю
     car = bot.get_car_by_id(car_id, user_id)
-    if not car:
-        # Если автомобиль не найден или не принадлежит пользователю, возвращаемся к списку
-        if update.callback_query:
-            await update.callback_query.message.edit_text(
-                "❌ Автомобиль не найден или доступ запрещен."
-            )
-        else:
-            await update.message.reply_text("❌ Автомобиль не найден или доступ запрещен.")
-        return await show_car_list(update, context)
 
-    # Получаем объект сообщения в зависимости от типа update
-    if update.callback_query:
-        message = update.callback_query.message
-    else:
-        message = update.message
+    if not car:
+        if update.callback_query:
+            await update.callback_query.message.edit_text("❌ Автомобиль не найден")
+        return await show_car_list(update, context)
 
     user_car_selection[user_id] = car_id
 
     car_name = f"{car[2]} {car[3]}" if car[2] and car[3] else car[1]
     stats = bot.get_car_statistics(car_id, user_id)
 
-    # Проверка необходимости замены масла
+    # Проверка масла
     oil_warning = ""
     if stats and stats['last_oil_change']:
-        last_oil_mileage, oil_type, next_oil_mileage, date = stats['last_oil_change']
-        current_mileage = stats['last_mileage']
-
-        if current_mileage >= next_oil_mileage:
+        last_mileage, oil_type, next_mileage, change_date, full_date = stats['last_oil_change']
+        current = stats['last_mileage']
+        if current >= next_mileage:
             oil_warning = "\n⚠️ ТРЕБУЕТСЯ ЗАМЕНА МАСЛА!"
-        elif next_oil_mileage - current_mileage < 1000:
-            oil_warning = f"\n⏰ Скоро замена масла (осталось {next_oil_mileage - current_mileage} км)"
+        elif next_mileage - current < 1000:
+            oil_warning = f"\n⏰ Осталось {next_mileage - current} км до замены масла"
+
+    header = f"🚗 {car_name}\n"
+    if car[6]:  # license_plate
+        header += f"📋 Госномер: {car[6]}\n"
+    if car[5]:  # VIN
+        header += f"🔢 VIN: `{car[5]}`\n"
+    header += f"💰 Всего: {stats['total']:,.0f} руб.\n"
+    header += f"📊 Пробег: {stats['last_mileage']} км"
+    header += oil_warning
 
     keyboard = [
         [InlineKeyboardButton("💰 Добавить расход", callback_data='add_expense')],
-        [InlineKeyboardButton("🔧 Техническое обслуживание", callback_data='service_menu')],
-        [InlineKeyboardButton("📊 Статистика", callback_data='view_stats')],
-        [InlineKeyboardButton("💵 Общие инвестиции", callback_data='total_investment')],
-        [InlineKeyboardButton("📝 Последние расходы", callback_data='recent_expenses')],
         [InlineKeyboardButton("🛢 Замена масла", callback_data='oil_change')],
+        [InlineKeyboardButton("🔧 Техобслуживание", callback_data='service_menu')],
+        [InlineKeyboardButton("📦 Расходники", callback_data='consumables_menu')],
+        [InlineKeyboardButton("📚 Каталоги", callback_data='catalogs_menu')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='view_stats')],
         [InlineKeyboardButton("✏️ Редактировать авто", callback_data='edit_car')],
-        [InlineKeyboardButton("❌ Удалить авто", callback_data='delete_car')],
+        [InlineKeyboardButton("🗑 Удалить авто", callback_data='delete_car')],
         [InlineKeyboardButton("🔙 К списку авто", callback_data='back_to_cars')]
     ]
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    header = f"🚗 {car_name}\n"
-    if car[5]:  # license_plate
-        header += f"📋 Госномер: {car[5]}\n"
-
-    if stats:
-        header += f"💰 Всего вложено: {stats['total']:,.2f} руб.\n"
-        header += f"📊 Текущий пробег: {stats['last_mileage']} км"
-    else:
-        header += f"💰 Всего вложено: 0 руб.\n"
-        header += f"📊 Текущий пробег: 0 км"
-
-    header += oil_warning
-
     if update.callback_query:
-        await message.edit_text(header, reply_markup=reply_markup)
+        await update.callback_query.message.edit_text(
+            header,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
     else:
-        await message.reply_text(header, reply_markup=reply_markup)
-
+        await update.message.reply_text(
+            header,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
     return MAIN_MENU
 
 
 async def show_car_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Показать список автомобилей пользователя"""
+    """Показать список автомобилей"""
     user_id = update.effective_user.id
     cars = bot.get_user_cars(user_id)
 
     keyboard = []
-    for car_id, name, brand, model, year, plate in cars:
-        car_info = f"{brand} {model}" if brand and model else name
-        if year:
-            car_info += f" ({year})"
-        keyboard.append([InlineKeyboardButton(f"🚗 {car_info}", callback_data=f'select_car_{car_id}')])
+    for car_id, name, brand, model, year, vin, plate, mileage in cars:
+        car_name = f"{brand} {model}" if brand and model else name
+        keyboard.append([InlineKeyboardButton(f"🚗 {car_name} ({mileage} км)", callback_data=f'select_car_{car_id}')])
 
-    keyboard.append([InlineKeyboardButton("➕ Добавить новый автомобиль", callback_data='add_car')])
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard.append([InlineKeyboardButton("➕ Добавить авто", callback_data='add_car')])
 
     if update.callback_query:
         await update.callback_query.message.edit_text(
             "🚗 Выберите автомобиль:",
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
     else:
         await update.message.reply_text(
             "🚗 Выберите автомобиль:",
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-
     return SELECT_CAR
 
 
+async def catalogs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Меню каталогов запчастей"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    current_car_id = user_car_selection.get(user_id)
+
+    # Получаем информацию о текущем автомобиле
+    car = None
+    if current_car_id:
+        car = bot.get_car_by_id(current_car_id, user_id)
+
+    text = "📚 КАТАЛОГИ ЗАПЧАСТЕЙ\n\n"
+
+    # Показываем VIN текущего автомобиля, если есть
+    if car and car[5]:  # VIN
+        text += f"🔢 VIN вашего автомобиля: `{car[5]}`\n"
+        text += "Скопируйте VIN для поиска в каталогах\n\n"
+
+    # Каталоги
+    for key, cat in CAR_CATALOGS.items():
+        text += f"🔗 {cat['name']}: {cat['url']}\n"
+        text += f"📝 {cat['description']}\n\n"
+
+    text += "💡 Вставьте VIN в поле поиска на сайте"
+
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]]
+    await query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    return MAIN_MENU
+
+
+async def show_oil_change_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Показать меню замены масла"""
+    query = update.callback_query
+    user_id = query.from_user.id
+    current_car_id = user_car_selection.get(user_id)
+
+    last_oil = bot.get_last_oil_change(current_car_id, user_id) if current_car_id else None
+
+    text = ""
+    if last_oil:
+        mileage, oil_type, next_mileage, change_date, full_date = last_oil
+        text = f"🛢 Последняя замена: {mileage} км, {oil_type}\n"
+        text += f"📅 Дата: {change_date}\n"
+        text += f"⏰ Следующая: {next_mileage} км\n\n"
+
+    text += "Введите текущий пробег (км):"
+    await query.message.edit_text(text, reply_markup=back_keyboard('menu'))
+    return OIL_MILEAGE
+
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработчик нажатий на кнопки"""
+    """Обработчик кнопок"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     current_car_id = user_car_selection.get(user_id)
 
-    # Обработка выбора автомобиля
+    # Обработка кнопок "Назад"
+    if query.data.startswith('back_to_'):
+        target = query.data.replace('back_to_', '')
+        if target == 'cars':
+            return await show_car_list(update, context)
+        elif target == 'menu' and current_car_id:
+            return await car_menu(update, context, current_car_id)
+        elif target == 'service_menu':
+            return await service_menu(update, context)
+        elif target == 'consumables':
+            return await consumables_menu(update, context)
+        elif target == 'oil_change':
+            return await show_oil_change_menu(update, context)
+
+    # Выбор автомобиля
     if query.data.startswith('select_car_'):
         car_id = int(query.data.replace('select_car_', ''))
         return await car_menu(update, context, car_id)
 
-    elif query.data == 'back_to_cars':
-        return await show_car_list(update, context)
-
+    # Добавление авто - пошагово
     elif query.data == 'add_car':
         await query.message.edit_text(
-            "➕ Добавление нового автомобиля\n\n"
-            "Введите информацию об автомобиле в формате:\n"
-            "Название, Марка, Модель, Год, Номер\n\n"
-            "Можно указать только название, остальное по желанию.\n"
-            "Пример: Моя Лада, Lada, Vesta, 2020, А123БВ777\n"
-            "Или просто: Моя машина"
+            "🚗 Введите название автомобиля:",
+            reply_markup=back_keyboard('cars')
         )
-        return ADD_CAR
+        return CAR_NAME
 
+    # Редактирование авто
     elif query.data == 'edit_car':
         if not current_car_id:
             return await show_car_list(update, context)
 
         car = bot.get_car_by_id(current_car_id, user_id)
         if not car:
-            await query.message.edit_text("❌ Автомобиль не найден или доступ запрещен.")
+            await query.message.edit_text("❌ Автомобиль не найден")
             return await show_car_list(update, context)
 
-        await query.message.edit_text(
-            f"✏️ Редактирование автомобиля\n\n"
-            f"Текущие данные:\n"
-            f"Название: {car[1]}\n"
-            f"Марка: {car[2] or 'не указана'}\n"
-            f"Модель: {car[3] or 'не указана'}\n"
-            f"Год: {car[4] or 'не указан'}\n"
-            f"Номер: {car[5] or 'не указан'}\n\n"
-            f"Введите новые данные в том же формате:"
-        )
-        return EDIT_CAR
+        # Показываем текущие данные и предлагаем ввести новые
+        text = f"✏️ РЕДАКТИРОВАНИЕ АВТОМОБИЛЯ\n\n"
+        text += f"Текущие данные:\n"
+        text += f"📝 Название: {car[1]}\n"
+        text += f"🏭 Марка: {car[2] or 'не указана'}\n"
+        text += f"🚘 Модель: {car[3] or 'не указана'}\n"
+        text += f"📅 Год: {car[4] or 'не указан'}\n"
+        text += f"🔢 VIN: {car[5] or 'не указан'}\n"
+        text += f"📋 Госномер: {car[6] or 'не указан'}\n\n"
+        text += "Введите новое название автомобиля:"
 
+        await query.message.edit_text(text, reply_markup=back_keyboard('menu'))
+        return EDIT_CAR_NAME
+
+    # Добавление расхода
+    elif query.data == 'add_expense':
+        await query.message.edit_text(
+            "💰 Введите сумму расхода:",
+            reply_markup=back_keyboard('menu')
+        )
+        return EXPENSE_AMOUNT
+
+    # Замена масла
+    elif query.data == 'oil_change':
+        return await show_oil_change_menu(update, context)
+
+    # Меню техобслуживания
+    elif query.data == 'service_menu':
+        return await service_menu(update, context)
+
+    # Меню расходников
+    elif query.data == 'consumables_menu':
+        return await consumables_menu(update, context)
+
+    # Меню каталогов
+    elif query.data == 'catalogs_menu':
+        return await catalogs_menu(update, context)
+
+    # Добавление расходника
+    elif query.data == 'add_consumable':
+        await query.message.edit_text(
+            "📦 Введите название расходника (например: Масляный фильтр):",
+            reply_markup=back_keyboard('consumables')
+        )
+        return CONSUMABLE_NAME
+
+    # Просмотр расходников
+    elif query.data == 'view_consumables':
+        return await view_consumables(update, context)
+
+    # Удаление расходника
+    elif query.data == 'delete_consumable_mode':
+        return await delete_consumable_mode(update, context)
+
+    elif query.data.startswith('delete_consumable_'):
+        consumable_id = int(query.data.replace('delete_consumable_', ''))
+        context.user_data['delete_consumable_id'] = consumable_id
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data='confirm_delete_consumable')],
+            [InlineKeyboardButton("❌ Нет, отмена", callback_data='view_consumables')]
+        ]
+        await query.message.edit_text(
+            "⚠️ Вы уверены, что хотите удалить этот расходник?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return DELETE_CONSUMABLE
+
+    elif query.data == 'confirm_delete_consumable':
+        consumable_id = context.user_data.get('delete_consumable_id')
+        if consumable_id and bot.delete_consumable(consumable_id, user_id):
+            await query.message.edit_text("✅ Расходник удален!")
+        else:
+            await query.message.edit_text("❌ Ошибка при удалении")
+        return await view_consumables(update, context)
+
+    # Удаление автомобиля
     elif query.data == 'delete_car':
         if not current_car_id:
             return await show_car_list(update, context)
 
         car = bot.get_car_by_id(current_car_id, user_id)
         if not car:
-            await query.message.edit_text("❌ Автомобиль не найден или доступ запрещен.")
+            await query.message.edit_text("❌ Автомобиль не найден")
             return await show_car_list(update, context)
 
         keyboard = [
             [InlineKeyboardButton("✅ Да, удалить", callback_data='confirm_delete_car')],
             [InlineKeyboardButton("❌ Нет, отмена", callback_data='back_to_menu')]
         ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
         await query.message.edit_text(
-            f"⚠️ Вы действительно хотите удалить автомобиль {car[1]}?\n"
-            f"Все связанные расходы и история обслуживания будут удалены!\n"
-            f"Это действие нельзя отменить.",
-            reply_markup=reply_markup
+            f"⚠️ ВНИМАНИЕ! Вы действительно хотите удалить автомобиль {car[1]}?\n\n"
+            f"Все связанные данные будут безвозвратно удалены:\n"
+            f"• История расходов\n"
+            f"• Замены масла\n"
+            f"• Техобслуживание\n"
+            f"• Расходники\n\n"
+            f"Это действие нельзя отменить!",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return DELETE_CAR
+        return DELETE_CAR_CONFIRM
 
     elif query.data == 'confirm_delete_car':
-        if current_car_id:
-            if bot.delete_car(current_car_id, user_id):
-                user_car_selection.pop(user_id, None)
-                await query.message.edit_text("✅ Автомобиль успешно удален!")
-            else:
-                await query.message.edit_text("❌ Ошибка при удалении автомобиля.")
-
-            # Возвращаемся к списку автомобилей
-            return await show_car_list(update, context)
-
-    elif query.data == 'service_menu':
-        keyboard = [
-            [InlineKeyboardButton("🛢 Замена масла", callback_data='oil_change')],
-            [InlineKeyboardButton("🔧 Плановое ТО", callback_data='planned_service')],
-            [InlineKeyboardButton("🔨 Ремонт", callback_data='repair_service')],
-            [InlineKeyboardButton("📋 История обслуживания", callback_data='service_history')],
-            [InlineKeyboardButton("🔙 Назад", callback_data='back_to_menu')]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.message.edit_text(
-            "🔧 Меню технического обслуживания\n\n"
-            "Выберите тип обслуживания:",
-            reply_markup=reply_markup
-        )
-        return SELECT_SERVICE_TYPE
-
-    elif query.data == 'oil_change':
-        if not current_car_id:
-            return await show_car_list(update, context)
-
-        last_oil = bot.get_last_oil_change(current_car_id, user_id)
-
-        if last_oil:
-            mileage, oil_type, next_mileage, date = last_oil
-            date_obj = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
-            formatted_date = date_obj.strftime('%d.%m.%Y')
-
-            text = (
-                f"🛢 Последняя замена масла:\n"
-                f"📅 Дата: {formatted_date}\n"
-                f"📊 Пробег: {mileage} км\n"
-                f"🛢 Масло: {oil_type or 'не указано'}\n"
-                f"⏰ Следующая замена: {next_mileage} км\n\n"
-            )
+        if current_car_id and bot.delete_car(current_car_id, user_id):
+            user_car_selection.pop(user_id, None)
+            await query.message.edit_text("✅ Автомобиль успешно удален!")
         else:
-            text = "🛢 Замена масла ещё не производилась\n\n"
+            await query.message.edit_text("❌ Ошибка при удалении автомобиля")
+        return await show_car_list(update, context)
 
-        text += "Введите данные о замене масла в формате:\n"
-        text += "Пробег, Тип масла (необязательно), Интервал замены (необязательно)\n"
-        text += "Пример: 15000, Mobil 5W30, 10000\n"
-        text += "Или просто: 15000"
+    # Плановое ТО или ремонт
+    elif query.data in ['planned_service', 'repair_service']:
+        service_type = "Плановое ТО" if query.data == 'planned_service' else "Ремонт"
+        context.user_data['service_type'] = service_type
+        await query.message.edit_text(
+            f"{service_type}\n\nВведите пробег (км):",
+            reply_markup=back_keyboard('service_menu')
+        )
+        return SERVICE_MILEAGE
 
-        await query.message.edit_text(text)
-        return SET_LAST_OIL_CHANGE
-
+    # История обслуживания
     elif query.data == 'service_history':
         if not current_car_id:
             return await show_car_list(update, context)
 
-        services = bot.get_service_history(current_car_id, user_id, 15)
+        services = bot.get_service_history(current_car_id, user_id, 10)
 
         if not services:
             text = "📋 История обслуживания пуста"
         else:
             text = "📋 ИСТОРИЯ ОБСЛУЖИВАНИЯ:\n\n"
-            for service_type, mileage, description, cost, date in services:
-                date_obj = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
-                formatted_date = date_obj.strftime('%d.%m.%Y')
-                text += f"📅 {formatted_date} | {mileage} км\n"
-                text += f"🔧 {service_type}\n"
-                if description:
-                    text += f"📝 {description}\n"
-                if cost:
-                    text += f"💰 {cost:,.2f} руб.\n"
-                text += "\n"
+            for stype, mileage, desc, cost, date in services:
+                d = datetime.strptime(date, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y')
+                text += f"📅 {d} | {mileage} км\n🔧 {stype}\n"
+                if desc: text += f"📝 {desc}\n"
+                if cost: text += f"💰 {cost:,.0f} руб.\n\n"
 
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data='service_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await query.message.edit_text(text, reply_markup=reply_markup)
+        await query.message.edit_text(text, reply_markup=back_keyboard('service_menu'))
         return SELECT_SERVICE_TYPE
 
-    elif query.data in ['planned_service', 'repair_service']:
-        service_type = "Плановое ТО" if query.data == 'planned_service' else "Ремонт"
-        context.user_data['service_type'] = service_type
+    # Статистика
+    elif query.data == 'view_stats' and current_car_id:
+        stats = bot.get_car_statistics(current_car_id, user_id)
+        car = bot.get_car_by_id(current_car_id, user_id)
 
-        await query.message.edit_text(
-            f"🔧 {service_type}\n\n"
-            f"Введите информацию в формате:\n"
-            f"Пробег, Описание, Стоимость\n"
-            f"Пример: 20000, Замена тормозных колодок, 5000"
-        )
-        return ADD_SERVICE
+        if not stats:
+            await query.message.edit_text("❌ Ошибка загрузки")
+            return await car_menu(update, context, current_car_id)
 
-    elif query.data == 'add_expense':
-        if not current_car_id:
-            return await show_car_list(update, context)
+        text = f"📊 СТАТИСТИКА {car[1]}\n"
+        text += f"{'=' * 30}\n\n"
+        text += f"💰 Всего расходов: {stats['total']:,.0f} руб.\n"
+        text += f"📊 Текущий пробег: {stats['last_mileage']} км\n"
 
-        await query.message.edit_text(
-            "📝 Опишите, что вы сделали с машиной и сколько потратили.\n"
-            "Введите в формате: Сумма Описание, Пробег(необязательно)\n"
-            "Примеры:\n"
-            "2500 Замена масла, 15000\n"
-            "1000 Мойка"
-        )
-        return ADD_EXPENSE
+        if stats['last_oil_change']:
+            m, t, n, cd, d = stats['last_oil_change']
+            text += f"\n🛢 Последняя замена масла:\n"
+            text += f"   📅 {cd} | {m} км\n"
+            text += f"   ⏰ Следующая: {n} км\n"
 
-    elif query.data == 'view_stats':
-        if not current_car_id:
-            return await show_car_list(update, context)
+        text += f"\n📝 ПОСЛЕДНИЕ РАСХОДЫ:\n"
+        text += f"{'-' * 30}\n"
 
-        return await show_statistics(update, context, current_car_id)
+        if stats['recent_expenses']:
+            for amount, description, mileage, expense_date in stats['recent_expenses'][:10]:
+                mileage_text = f" [{mileage} км]" if mileage else ""
+                text += f"• {expense_date}{mileage_text}\n"
+                text += f"  {description}: {amount:,.0f} руб.\n"
+        else:
+            text += "Нет расходов за последние 30 дней\n"
 
-    elif query.data == 'total_investment':
-        if not current_car_id:
-            return await show_car_list(update, context)
-
-        await query.message.edit_text(
-            "💰 Введите общую сумму инвестиций в машину и описание:\n"
-            "Формат: Сумма Описание\n"
-            "Например: 500000 Покупка автомобиля"
-        )
-        return SET_TOTAL_INVESTMENT
-
-    elif query.data == 'recent_expenses':
-        if not current_car_id:
-            return await show_car_list(update, context)
-
-        return await show_recent_expenses(update, context, current_car_id)
-
-    elif query.data == 'delete_expense':
-        if not current_car_id:
-            return await show_car_list(update, context)
-
-        return await confirm_delete(update, context, current_car_id)
-
-    elif query.data == 'confirm_delete_yes':
-        return await handle_delete_confirmation(update, context)
-
-    elif query.data == 'back_to_menu':
-        if not current_car_id:
-            return await show_car_list(update, context)
-
-        return await car_menu(update, context, current_car_id)
+        await query.message.edit_text(text, reply_markup=back_keyboard('menu'))
+        return MAIN_MENU
 
     return MAIN_MENU
 
 
-async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE, car_id: int) -> int:
-    """Показать статистику расходов по автомобилю"""
+async def service_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Меню техобслуживания"""
     query = update.callback_query
-    user_id = query.from_user.id
-
-    stats = bot.get_car_statistics(car_id, user_id)
-    car = bot.get_car_by_id(car_id, user_id)
-
-    if not car or not stats:
-        await query.message.edit_text("❌ Ошибка загрузки статистики.")
-        return await show_car_list(update, context)
-
-    stats_text = (
-        f"📊 СТАТИСТИКА ПО АВТОМОБИЛЮ {car[1]}\n\n"
-        f"💰 Общие инвестиции: {stats['total_investment']:,.2f} руб.\n"
-        f"📅 Ежедневные расходы: {stats['daily_expenses']:,.2f} руб.\n"
-        f"💵 ВСЕГО ВЛОЖЕНО: {stats['total']:,.2f} руб.\n"
-        f"📊 Текущий пробег: {stats['last_mileage']} км\n"
+    keyboard = [
+        [InlineKeyboardButton("🔧 Плановое ТО", callback_data='planned_service')],
+        [InlineKeyboardButton("🔨 Ремонт", callback_data='repair_service')],
+        [InlineKeyboardButton("📋 История", callback_data='service_history')]
+    ]
+    await query.message.edit_text(
+        "🔧 Техническое обслуживание:",
+        reply_markup=keyboard_with_back(keyboard, 'menu')
     )
+    return SELECT_SERVICE_TYPE
 
-    if stats['last_oil_change']:
-        last_oil_mileage, oil_type, next_mileage, date = stats['last_oil_change']
-        date_obj = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
-        formatted_date = date_obj.strftime('%d.%m.%Y')
 
-        stats_text += f"\n🛢 Последняя замена масла:\n"
-        stats_text += f"   Дата: {formatted_date}\n"
-        stats_text += f"   Пробег: {last_oil_mileage} км\n"
-        stats_text += f"   Следующая: {next_mileage} км\n"
-
-        if stats['last_mileage'] >= next_mileage:
-            stats_text += "   ⚠️ ТРЕБУЕТСЯ ЗАМЕНА!\n"
-        elif next_mileage - stats['last_mileage'] < 1000:
-            stats_text += f"   ⏰ Осталось {next_mileage - stats['last_mileage']} км\n"
-
-    keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.message.edit_text(stats_text, reply_markup=reply_markup)
+async def consumables_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Меню расходников"""
+    query = update.callback_query
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить расходник", callback_data='add_consumable')],
+        [InlineKeyboardButton("📋 Список расходников", callback_data='view_consumables')],
+        [InlineKeyboardButton("🗑 Удалить расходник", callback_data='delete_consumable_mode')]
+    ]
+    await query.message.edit_text(
+        "📦 Управление расходниками:",
+        reply_markup=keyboard_with_back(keyboard, 'menu')
+    )
     return MAIN_MENU
 
 
-async def show_recent_expenses(update: Update, context: ContextTypes.DEFAULT_TYPE, car_id: int) -> int:
-    """Показать последние расходы"""
+async def view_consumables(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Просмотр расходников"""
     query = update.callback_query
     user_id = query.from_user.id
+    current_car_id = user_car_selection.get(user_id)
 
-    expenses = bot.get_recent_expenses(car_id, user_id, 15)
+    consumables = bot.get_consumables(user_id, current_car_id)
 
-    if not expenses:
-        text = "📝 У вас пока нет записей о расходах."
+    if not consumables:
+        text = "📦 Список расходников пуст"
     else:
-        text = "📝 ПОСЛЕДНИЕ РАСХОДЫ:\n\n"
-        for amount, description, mileage, date in expenses:
-            date_obj = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
-            formatted_date = date_obj.strftime('%d.%m.%Y %H:%M')
-            mileage_text = f" [{mileage} км]" if mileage else ""
-            text += f"• {formatted_date}{mileage_text}\n  {description}: {amount:,.2f} руб.\n\n"
+        text = "📦 ВАШИ РАСХОДНИКИ:\n\n"
+        for cid, name, part_num, notes, date in consumables:
+            d = datetime.strptime(date, '%Y-%m-%d %H:%M:%S').strftime('%d.%m.%Y')
+            text += f"📌 {name}\n"
+            if part_num: text += f"   🔢 Артикул: {part_num}\n"
+            if notes: text += f"   📝 {notes}\n"
+            text += f"   📅 {d}\n\n"
 
-    keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.message.edit_text(text, reply_markup=reply_markup)
+    await query.message.edit_text(text, reply_markup=back_keyboard('consumables'))
     return MAIN_MENU
 
 
-async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, car_id: int) -> int:
-    """Подтверждение удаления последнего расхода"""
+async def delete_consumable_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Режим выбора расходника для удаления"""
     query = update.callback_query
     user_id = query.from_user.id
+    current_car_id = user_car_selection.get(user_id)
 
-    expense = bot.get_last_expense(car_id, user_id)
+    consumables = bot.get_consumables(user_id, current_car_id)
 
-    if not expense:
-        text = "❌ Нет записей для удаления."
-        keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-    else:
-        expense_id, amount, description, date = expense
-        date_obj = datetime.strptime(date, '%Y-%m-%d %H:%M:%S')
-        formatted_date = date_obj.strftime('%d.%m.%Y %H:%M')
-
-        text = (
-            f"⚠️ Подтвердите удаление последнего расхода:\n\n"
-            f"📅 {formatted_date}\n"
-            f"📝 {description}\n"
-            f"💰 {amount:,.2f} руб.\n\n"
-            f"Действие нельзя отменить!"
+    if not consumables:
+        await query.message.edit_text(
+            "📦 Нет расходников для удаления",
+            reply_markup=back_keyboard('consumables')
         )
+        return MAIN_MENU
 
-        context.user_data['delete_expense_id'] = expense_id
-        context.user_data['delete_car_id'] = car_id
+    keyboard = []
+    for cid, name, part_num, notes, date in consumables[:10]:
+        display_name = f"{name}"
+        if part_num:
+            display_name += f" ({part_num})"
+        keyboard.append([InlineKeyboardButton(f"❌ {display_name}", callback_data=f'delete_consumable_{cid}')])
 
-        keyboard = [
-            [InlineKeyboardButton("✅ Да, удалить", callback_data='confirm_delete_yes')],
-            [InlineKeyboardButton("❌ Нет, отмена", callback_data='back_to_menu')]
-        ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.edit_text(text, reply_markup=reply_markup)
-    return DELETE_EXPENSE
-
-
-async def handle_delete_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка подтверждения удаления"""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    expense_id = context.user_data.get('delete_expense_id')
-    car_id = context.user_data.get('delete_car_id')
-
-    if expense_id and car_id and bot.delete_expense_by_id(expense_id, car_id, user_id):
-        text = "✅ Расход успешно удален!"
-    else:
-        text = "❌ Ошибка при удалении"
-
-    keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.message.edit_text(text, reply_markup=reply_markup)
-    return MAIN_MENU
+    await query.message.edit_text(
+        "🗑 Выберите расходник для удаления:",
+        reply_markup=keyboard_with_back(keyboard, 'consumables')
+    )
+    return DELETE_CONSUMABLE
 
 
-async def handle_car_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода нового автомобиля"""
-    user_id = update.effective_user.id
-    text = update.message.text
-
-    # Парсим введенные данные
-    parts = [p.strip() for p in text.split(',')]
-
-    name = parts[0]
-    brand = parts[1] if len(parts) > 1 else ""
-    model = parts[2] if len(parts) > 2 else ""
-
-    year = None
-    if len(parts) > 3 and parts[3].strip():
-        try:
-            year = int(parts[3])
-        except ValueError:
-            year = None
-
-    license_plate = parts[4] if len(parts) > 4 else ""
-
-    car_id = bot.add_car(user_id, name, brand, model, year, license_plate)
-
-    keyboard = [[InlineKeyboardButton(f"🚗 Перейти к автомобилю", callback_data=f'select_car_{car_id}')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
+# === ПОШАГОВОЕ ДОБАВЛЕНИЕ АВТОМОБИЛЯ ===
+async def car_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['car_name'] = update.message.text
     await update.message.reply_text(
-        f"✅ Автомобиль успешно добавлен!\n\n"
-        f"Название: {name}\n"
-        f"Марка: {brand or 'не указана'}\n"
-        f"Модель: {model or 'не указана'}\n"
-        f"Год: {year or 'не указан'}\n"
-        f"Номер: {license_plate or 'не указан'}",
-        reply_markup=reply_markup
+        "Введите марку автомобиля (или отправьте '-' чтобы пропустить):",
+        reply_markup=back_keyboard('cars')
+    )
+    return CAR_BRAND
+
+
+async def car_brand_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['car_brand'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите модель (или отправьте '-' чтобы пропустить):",
+        reply_markup=back_keyboard('cars')
+    )
+    return CAR_MODEL
+
+
+async def car_model_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['car_model'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите год выпуска (или отправьте '-' чтобы пропустить):",
+        reply_markup=back_keyboard('cars')
+    )
+    return CAR_YEAR
+
+
+async def car_year_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    try:
+        context.user_data['car_year'] = int(text) if text != '-' else None
+    except:
+        context.user_data['car_year'] = None
+    await update.message.reply_text(
+        "Введите VIN номер (или отправьте '-' чтобы пропустить):",
+        reply_markup=back_keyboard('cars')
+    )
+    return CAR_VIN
+
+
+async def car_vin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['car_vin'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите госномер (или отправьте '-' чтобы пропустить):",
+        reply_markup=back_keyboard('cars')
+    )
+    return CAR_PLATE
+
+
+async def car_plate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    license_plate = text if text != '-' else ""
+
+    user_id = update.effective_user.id
+    car_id = bot.add_car(
+        user_id,
+        context.user_data['car_name'],
+        context.user_data.get('car_brand', ''),
+        context.user_data.get('car_model', ''),
+        context.user_data.get('car_year'),
+        context.user_data.get('car_vin', ''),
+        license_plate
     )
 
+    # Очищаем временные данные
+    for key in ['car_name', 'car_brand', 'car_model', 'car_year', 'car_vin']:
+        context.user_data.pop(key, None)
+
+    keyboard = [[InlineKeyboardButton(f"🚗 Перейти к авто", callback_data=f'select_car_{car_id}')]]
+    await update.message.reply_text(
+        "✅ Автомобиль успешно добавлен!",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return SELECT_CAR
 
 
-async def handle_edit_car_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка редактирования автомобиля"""
+# === ПОШАГОВОЕ РЕДАКТИРОВАНИЕ АВТОМОБИЛЯ ===
+async def edit_car_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['edit_car_name'] = update.message.text
+    await update.message.reply_text(
+        "Введите новую марку автомобиля (или отправьте '-' чтобы оставить без изменений):",
+        reply_markup=back_keyboard('menu')
+    )
+    return EDIT_CAR_BRAND
+
+
+async def edit_car_brand_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['edit_car_brand'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите новую модель (или отправьте '-' чтобы оставить без изменений):",
+        reply_markup=back_keyboard('menu')
+    )
+    return EDIT_CAR_MODEL
+
+
+async def edit_car_model_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['edit_car_model'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите новый год выпуска (или отправьте '-' чтобы оставить без изменений):",
+        reply_markup=back_keyboard('menu')
+    )
+    return EDIT_CAR_YEAR
+
+
+async def edit_car_year_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    try:
+        context.user_data['edit_car_year'] = int(text) if text != '-' else None
+    except:
+        context.user_data['edit_car_year'] = None
+    await update.message.reply_text(
+        "Введите новый VIN номер (или отправьте '-' чтобы оставить без изменений):",
+        reply_markup=back_keyboard('menu')
+    )
+    return EDIT_CAR_VIN
+
+
+async def edit_car_vin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['edit_car_vin'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите новый госномер (или отправьте '-' чтобы оставить без изменений):",
+        reply_markup=back_keyboard('menu')
+    )
+    return EDIT_CAR_PLATE
+
+
+async def edit_car_plate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    license_plate = text if text != '-' else ""
+
     user_id = update.effective_user.id
     car_id = user_car_selection.get(user_id)
 
-    if not car_id:
-        return await start(update, context)
-
-    text = update.message.text
-    parts = [p.strip() for p in text.split(',')]
-
-    name = parts[0]
-    brand = parts[1] if len(parts) > 1 else ""
-    model = parts[2] if len(parts) > 2 else ""
-
-    year = None
-    if len(parts) > 3 and parts[3].strip():
-        try:
-            year = int(parts[3])
-        except ValueError:
-            year = None
-
-    license_plate = parts[4] if len(parts) > 4 else ""
-
-    if bot.update_car(car_id, user_id, name, brand, model, year, license_plate):
-        keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            f"✅ Автомобиль успешно обновлен!",
-            reply_markup=reply_markup
-        )
+    if bot.update_car(
+            car_id,
+            user_id,
+            context.user_data['edit_car_name'],
+            context.user_data.get('edit_car_brand', ''),
+            context.user_data.get('edit_car_model', ''),
+            context.user_data.get('edit_car_year'),
+            context.user_data.get('edit_car_vin', ''),
+            license_plate
+    ):
+        await update.message.reply_text("✅ Автомобиль успешно обновлен!")
     else:
-        await update.message.reply_text("❌ Ошибка при обновлении автомобиля.")
+        await update.message.reply_text("❌ Ошибка при обновлении автомобиля")
 
-    return MAIN_MENU
+    # Очищаем временные данные
+    for key in ['edit_car_name', 'edit_car_brand', 'edit_car_model', 'edit_car_year', 'edit_car_vin']:
+        context.user_data.pop(key, None)
+
+    return await car_menu(update, context, car_id)
 
 
-async def handle_expense_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода расхода"""
-    user_id = update.effective_user.id
-    car_id = user_car_selection.get(user_id)
-
-    if not car_id:
-        return await start(update, context)
-
-    text = update.message.text
-
+# === ПОШАГОВОЕ ДОБАВЛЕНИЕ РАСХОДА ===
+async def expense_amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        # Парсим введенные данные
-        if ',' in text:
-            expense_part, mileage_part = text.split(',', 1)
-            amount_desc = expense_part.strip()
-            try:
-                mileage = int(mileage_part.strip())
-            except ValueError:
-                mileage = None
-        else:
-            amount_desc = text
-            mileage = None
-
-        parts = amount_desc.split(' ', 1)
-        amount = float(parts[0].replace(',', '.'))
-        description = parts[1] if len(parts) > 1 else "Без описания"
-
-        # Сохраняем в базу данных
-        if bot.add_daily_expense(car_id, user_id, amount, description, mileage):
-            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
-            response = f"✅ Расход успешно добавлен!\n\n💰 Сумма: {amount:,.2f} руб.\n📝 Описание: {description}"
-            if mileage:
-                response += f"\n📊 Пробег: {mileage} км"
-
-            await update.message.reply_text(response, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text("❌ Ошибка при добавлении расхода.")
-
-    except (ValueError, IndexError):
+        amount = float(update.message.text.replace(',', '.'))
+        context.user_data['expense_amount'] = amount
         await update.message.reply_text(
-            "❌ Неверный формат. Пожалуйста, введите сумму и описание через пробел.\n"
-            "Пример: 2500 Замена масла, 15000"
+            "Введите описание расхода:",
+            reply_markup=back_keyboard('menu')
         )
-        return ADD_EXPENSE
+        return EXPENSE_DESC
+    except:
+        await update.message.reply_text(
+            "❌ Неверный формат. Введите число (например: 1500):",
+            reply_markup=back_keyboard('menu')
+        )
+        return EXPENSE_AMOUNT
 
-    return MAIN_MENU
+
+async def expense_desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['expense_desc'] = update.message.text
+    await update.message.reply_text(
+        "Введите пробег (км) или отправьте '-' чтобы пропустить:",
+        reply_markup=back_keyboard('menu')
+    )
+    return EXPENSE_MILEAGE
 
 
-async def handle_total_investment_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода общей инвестиции"""
+async def expense_mileage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    try:
+        mileage = None if text == '-' else int(text)
+        context.user_data['expense_mileage'] = mileage
+    except:
+        context.user_data['expense_mileage'] = None
+
+    await update.message.reply_text(
+        "Введите дату расхода в формате ДД.ММ.ГГГГ\n"
+        "(или отправьте '-' чтобы использовать сегодняшнюю дату):",
+        reply_markup=back_keyboard('menu')
+    )
+    return EXPENSE_DATE
+
+
+async def expense_date_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     car_id = user_car_selection.get(user_id)
 
-    if not car_id:
-        return await start(update, context)
-
     text = update.message.text
 
-    try:
-        parts = text.split(' ', 1)
-        amount = float(parts[0].replace(',', '.'))
-        description = parts[1] if len(parts) > 1 else "Инвестиция в авто"
-
-        if bot.add_total_investment(car_id, user_id, amount, description):
-            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
+    if text == '-':
+        expense_date = datetime.now().strftime('%Y-%m-%d')
+    else:
+        try:
+            day, month, year = map(int, text.split('.'))
+            expense_date = datetime(year, month, day).strftime('%Y-%m-%d')
+        except:
             await update.message.reply_text(
-                f"✅ Инвестиция успешно добавлена!\n\n"
-                f"💰 Сумма: {amount:,.2f} руб.\n"
-                f"📝 Описание: {description}",
-                reply_markup=reply_markup
+                "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ\n"
+                "Например: 16.02.2026",
+                reply_markup=back_keyboard('menu')
             )
-        else:
-            await update.message.reply_text("❌ Ошибка при добавлении инвестиции.")
+            return EXPENSE_DATE
 
-    except (ValueError, IndexError):
+    if bot.add_daily_expense(
+            car_id,
+            user_id,
+            context.user_data['expense_amount'],
+            context.user_data['expense_desc'],
+            context.user_data.get('expense_mileage'),
+            expense_date
+    ):
+        date_formatted = datetime.strptime(expense_date, '%Y-%m-%d').strftime('%d.%m.%Y')
+        await update.message.reply_text(f"✅ Расход на {date_formatted} добавлен!")
+    else:
+        await update.message.reply_text("❌ Ошибка при добавлении расхода")
+
+    # Очищаем данные
+    for key in ['expense_amount', 'expense_desc', 'expense_mileage']:
+        context.user_data.pop(key, None)
+
+    return await car_menu(update, context, car_id)
+
+
+# === ПОШАГОВАЯ ЗАМЕНА МАСЛА ===
+async def oil_mileage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        mileage = int(update.message.text)
+        context.user_data['oil_mileage'] = mileage
         await update.message.reply_text(
-            "❌ Неверный формат. Пожалуйста, введите сумму и описание через пробел.\n"
-            "Например: 500000 Покупка автомобиля"
+            "Введите тип масла (или отправьте '-' чтобы пропустить):",
+            reply_markup=back_keyboard('oil_change')
         )
-        return SET_TOTAL_INVESTMENT
+        return OIL_TYPE
+    except:
+        await update.message.reply_text(
+            "❌ Введите число (пробег в км):",
+            reply_markup=back_keyboard('menu')
+        )
+        return OIL_MILEAGE
 
-    return MAIN_MENU
+
+async def oil_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['oil_type'] = text if text != '-' else ""
+    await update.message.reply_text(
+        "Введите интервал замены (км) или отправьте '-' для стандартного (10000 км):",
+        reply_markup=back_keyboard('oil_change')
+    )
+    return OIL_INTERVAL
 
 
-async def handle_oil_change_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода замены масла"""
+async def oil_interval_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    if text == '-':
+        context.user_data['oil_interval'] = None
+    else:
+        try:
+            interval = int(text)
+            context.user_data['oil_interval'] = interval
+        except:
+            context.user_data['oil_interval'] = None
+
+    await update.message.reply_text(
+        "Введите дату замены в формате ДД.ММ.ГГГГ\n"
+        "(или отправьте '-' чтобы использовать сегодняшнюю дату):",
+        reply_markup=back_keyboard('oil_change')
+    )
+    return OIL_DATE
+
+
+async def oil_date_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     car_id = user_car_selection.get(user_id)
 
-    if not car_id:
-        return await start(update, context)
-
     text = update.message.text
-    parts = [p.strip() for p in text.split(',')]
 
-    try:
-        mileage = int(parts[0])
-        oil_type = parts[1] if len(parts) > 1 else ""
-
-        if len(parts) > 2:
-            next_interval = int(parts[2])
-            next_mileage = mileage + next_interval
-        else:
-            next_mileage = mileage + 10000  # По умолчанию через 10000 км
-
-        if bot.add_oil_change(car_id, user_id, mileage, oil_type, next_mileage):
-            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-
+    if text == '-':
+        change_date = datetime.now().strftime('%Y-%m-%d')
+    else:
+        try:
+            day, month, year = map(int, text.split('.'))
+            change_date = datetime(year, month, day).strftime('%Y-%m-%d')
+        except:
             await update.message.reply_text(
-                f"✅ Замена масла зарегистрирована!\n\n"
-                f"📊 Пробег: {mileage} км\n"
-                f"🛢 Масло: {oil_type or 'не указано'}\n"
-                f"⏰ Следующая замена: {next_mileage} км",
-                reply_markup=reply_markup
+                "❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ",
+                reply_markup=back_keyboard('oil_change')
             )
-        else:
-            await update.message.reply_text("❌ Ошибка при регистрации замены масла.")
+            return OIL_DATE
 
-    except ValueError:
+    mileage = context.user_data['oil_mileage']
+    interval = context.user_data.get('oil_interval')
+    next_mileage = mileage + interval if interval else mileage + 10000
+
+    if bot.add_oil_change(
+            car_id,
+            user_id,
+            mileage,
+            context.user_data.get('oil_type', ''),
+            next_mileage,
+            change_date
+    ):
+        date_formatted = datetime.strptime(change_date, '%Y-%m-%d').strftime('%d.%m.%Y')
+        await update.message.reply_text(f"✅ Замена масла на {date_formatted} зарегистрирована!")
+    else:
+        await update.message.reply_text("❌ Ошибка при регистрации замены масла")
+
+    # Очищаем данные
+    context.user_data.pop('oil_mileage', None)
+    context.user_data.pop('oil_type', None)
+    context.user_data.pop('oil_interval', None)
+
+    return await car_menu(update, context, car_id)
+
+
+# === ПОШАГОВОЕ ТЕХОБСЛУЖИВАНИЕ ===
+async def service_mileage_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        mileage = int(update.message.text)
+        context.user_data['service_mileage'] = mileage
         await update.message.reply_text(
-            "❌ Неверный формат. Пожалуйста, введите пробег и опционально тип масла и интервал.\n"
-            "Пример: 15000, Mobil 5W30, 10000"
+            "Введите описание работ:",
+            reply_markup=back_keyboard('service_menu')
         )
-        return SET_LAST_OIL_CHANGE
+        return SERVICE_DESC
+    except:
+        await update.message.reply_text(
+            "❌ Введите число (пробег в км):",
+            reply_markup=back_keyboard('service_menu')
+        )
+        return SERVICE_MILEAGE
 
-    return MAIN_MENU
+
+async def service_desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['service_desc'] = update.message.text
+    await update.message.reply_text(
+        "Введите стоимость (или отправьте '-' если неизвестно):",
+        reply_markup=back_keyboard('service_menu')
+    )
+    return SERVICE_COST
 
 
-async def handle_service_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обработка ввода техобслуживания"""
+async def service_cost_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     car_id = user_car_selection.get(user_id)
 
-    if not car_id:
-        return await start(update, context)
-
     text = update.message.text
-    parts = [p.strip() for p in text.split(',')]
-
     try:
-        mileage = int(parts[0])
-        description = parts[1] if len(parts) > 1 else ""
-        cost = float(parts[2].replace(',', '.')) if len(parts) > 2 else 0
+        cost = 0 if text == '-' else float(text.replace(',', '.'))
+    except:
+        cost = 0
 
-        service_type = context.user_data.get('service_type', 'Техобслуживание')
+    service_type = context.user_data.get('service_type', 'Техобслуживание')
 
-        if bot.add_service_record(car_id, user_id, service_type, mileage, description, cost):
-            keyboard = [[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]]
-            reply_markup = InlineKeyboardMarkup(keyboard)
+    if bot.add_service_record(
+            car_id,
+            user_id,
+            service_type,
+            context.user_data['service_mileage'],
+            context.user_data.get('service_desc', ''),
+            cost
+    ):
+        await update.message.reply_text("✅ Запись о ТО добавлена!")
+    else:
+        await update.message.reply_text("❌ Ошибка при добавлении записи")
 
-            response = f"✅ Запись о ТО добавлена!\n\n🔧 {service_type}\n📊 Пробег: {mileage} км"
-            if description:
-                response += f"\n📝 {description}"
-            if cost:
-                response += f"\n💰 {cost:,.2f} руб."
+    # Очищаем данные
+    context.user_data.pop('service_mileage', None)
+    context.user_data.pop('service_desc', None)
+    context.user_data.pop('service_type', None)
 
-            await update.message.reply_text(response, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text("❌ Ошибка при добавлении записи о ТО.")
+    return await car_menu(update, context, car_id)
 
-    except (ValueError, IndexError):
-        await update.message.reply_text(
-            "❌ Неверный формат. Пожалуйста, введите пробег, описание и стоимость через запятую.\n"
-            "Пример: 20000, Замена тормозных колодок, 5000"
+
+# === ПОШАГОВОЕ ДОБАВЛЕНИЕ РАСХОДНИКА ===
+async def consumable_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['consumable_name'] = update.message.text
+    await update.message.reply_text(
+        "Введите артикул (или отправьте '-' чтобы пропустить):",
+        reply_markup=back_keyboard('consumables')
+    )
+    return CONSUMABLE_PART_NUMBER
+
+
+async def consumable_part_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text
+    context.user_data['consumable_part'] = text if text != '-' else ""
+
+    user_id = update.effective_user.id
+    cars = bot.get_user_cars(user_id)
+
+    if len(cars) == 1:
+        car_id = cars[0][0]
+        bot.add_consumable(
+            user_id,
+            car_id,
+            context.user_data['consumable_name'],
+            context.user_data['consumable_part'],
+            ""
         )
-        return ADD_SERVICE
+
+        context.user_data.pop('consumable_name', None)
+        context.user_data.pop('consumable_part', None)
+
+        await update.message.reply_text("✅ Расходник добавлен!")
+        return await car_menu(update, context, car_id)
+    else:
+        keyboard = []
+        for car_id, name, brand, model, year, vin, plate, mileage in cars:
+            car_name = f"{brand} {model}" if brand and model else name
+            keyboard.append([InlineKeyboardButton(f"🚗 {car_name}", callback_data=f'consumable_car_{car_id}')])
+
+        await update.message.reply_text(
+            "Выберите автомобиль для расходника:",
+            reply_markup=keyboard_with_back(keyboard, 'consumables')
+        )
+        return CONSUMABLE_CAR
+
+
+async def consumable_car_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data.startswith('consumable_car_'):
+        car_id = int(query.data.replace('consumable_car_', ''))
+        user_id = query.from_user.id
+
+        bot.add_consumable(
+            user_id,
+            car_id,
+            context.user_data['consumable_name'],
+            context.user_data['consumable_part'],
+            ""
+        )
+
+        context.user_data.pop('consumable_name', None)
+        context.user_data.pop('consumable_part', None)
+
+        await query.message.edit_text("✅ Расходник добавлен!")
+        return await car_menu(update, context, car_id)
 
     return MAIN_MENU
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена действия"""
-    await update.message.reply_text(
-        "Действие отменено. Используйте /start для возврата в меню."
-    )
-    return ConversationHandler.END
+    user_id = update.effective_user.id
+    current_car_id = user_car_selection.get(user_id)
 
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик ошибок"""
-    logger.error(f"Ошибка: {context.error}")
+    if current_car_id:
+        await update.message.reply_text("❌ Действие отменено")
+        return await car_menu(update, context, current_car_id)
+    else:
+        await update.message.reply_text("❌ Действие отменено")
+        return await show_car_list(update, context)
 
 
 def main():
-    """Основная функция запуска бота"""
-    # Создаем приложение
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Создаем обработчик разговора
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
             SELECT_CAR: [
                 CallbackQueryHandler(button_handler),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_car_input)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_name_handler)
             ],
-            MAIN_MENU: [
-                CallbackQueryHandler(button_handler)
+            MAIN_MENU: [CallbackQueryHandler(button_handler)],
+
+            # Состояния добавления авто
+            CAR_NAME: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_name_handler)
             ],
-            ADD_CAR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_car_input),
-                CallbackQueryHandler(button_handler)
+            CAR_BRAND: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_brand_handler)
             ],
-            EDIT_CAR: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_car_input),
-                CallbackQueryHandler(button_handler)
+            CAR_MODEL: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_model_handler)
             ],
-            DELETE_CAR: [
-                CallbackQueryHandler(button_handler)
+            CAR_YEAR: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_year_handler)
             ],
-            ADD_EXPENSE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_expense_input),
-                CallbackQueryHandler(button_handler)
+            CAR_VIN: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_vin_handler)
             ],
-            SET_TOTAL_INVESTMENT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_total_investment_input),
-                CallbackQueryHandler(button_handler)
+            CAR_PLATE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, car_plate_handler)
             ],
-            DELETE_EXPENSE: [
-                CallbackQueryHandler(button_handler)
+
+            # Состояния редактирования авто
+            EDIT_CAR_NAME: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_car_name_handler)
             ],
-            SELECT_SERVICE_TYPE: [
-                CallbackQueryHandler(button_handler)
+            EDIT_CAR_BRAND: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_car_brand_handler)
             ],
-            SET_LAST_OIL_CHANGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_oil_change_input),
-                CallbackQueryHandler(button_handler)
+            EDIT_CAR_MODEL: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_car_model_handler)
             ],
-            ADD_SERVICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_service_input),
-                CallbackQueryHandler(button_handler)
-            ]
+            EDIT_CAR_YEAR: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_car_year_handler)
+            ],
+            EDIT_CAR_VIN: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_car_vin_handler)
+            ],
+            EDIT_CAR_PLATE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, edit_car_plate_handler)
+            ],
+
+            # Состояния расхода
+            EXPENSE_AMOUNT: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_amount_handler)
+            ],
+            EXPENSE_DESC: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_desc_handler)
+            ],
+            EXPENSE_MILEAGE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_mileage_handler)
+            ],
+            EXPENSE_DATE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, expense_date_handler)
+            ],
+
+            # Состояния замены масла
+            OIL_MILEAGE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, oil_mileage_handler)
+            ],
+            OIL_TYPE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, oil_type_handler)
+            ],
+            OIL_INTERVAL: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, oil_interval_handler)
+            ],
+            OIL_DATE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, oil_date_handler)
+            ],
+
+            # Состояния ТО
+            SERVICE_MILEAGE: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, service_mileage_handler)
+            ],
+            SERVICE_DESC: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, service_desc_handler)
+            ],
+            SERVICE_COST: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, service_cost_handler)
+            ],
+
+            # Состояния расходников
+            CONSUMABLE_NAME: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, consumable_name_handler)
+            ],
+            CONSUMABLE_PART_NUMBER: [
+                CallbackQueryHandler(button_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, consumable_part_handler)
+            ],
+            CONSUMABLE_CAR: [CallbackQueryHandler(consumable_car_handler)],
+            DELETE_CONSUMABLE: [CallbackQueryHandler(button_handler)],
+
+            # Состояние подтверждения удаления авто
+            DELETE_CAR_CONFIRM: [CallbackQueryHandler(button_handler)],
+
+            SELECT_SERVICE_TYPE: [CallbackQueryHandler(button_handler)]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler('cancel', cancel)],
+        per_message=False
     )
 
     application.add_handler(conv_handler)
-    application.add_error_handler(error_handler)
-
-    # Запускаем бота
-    print("🚗 Финансовый ассистент автомобиля запущен...")
-    print("Бот готов к работе с несколькими пользователями!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🚗 Бот запущен...")
+    print("✅ Кнопка 'Назад' есть во всех меню")
+    print("✅ Добавлена дата в замену масла")
+    print("✅ Пробег автоматически обновляется")
+    print("✅ Удаление расходников")
+    print("✅ Удаление автомобилей")
+    print("✅ Редактирование автомобилей")
+    print("✅ Каталоги: Japancats и ETK")
+    print("✅ VIN отображается в каталогах")
+    application.run_polling()
 
 
 if __name__ == '__main__':
